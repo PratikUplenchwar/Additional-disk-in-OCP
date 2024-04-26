@@ -1,0 +1,103 @@
+Steps I followed to change the device name from /dev/sdX to by-path option.
+[1] Label the intended nodes with the custom label:
+~~~
+$ oc label node/worker1.lab.ocp.lan node/worker2.lab.ocp.lan node-role.kubernetes.io/custom=
+~~~
+[2] Verify the nodes once, make sure that nodes should not have only custom label. 
+[3] Create the Machine Config Pool for custom resource,:
+~~~
+$ cat custom.yaml
+#############
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfigPool
+metadata:
+  name: custom
+spec:
+  machineConfigSelector:
+    matchExpressions:
+     - key: machineconfiguration.openshift.io/role
+       operator: In
+       values: [custom, worker]
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/custom: ""
+#############
+$ oc create -f custom.yaml
+~~~
+[4] Verify that the custom MCP is correctly created. If the UPDATING field is marked as 
+true for the custom MCP, then wait until the MCO updates the node.
+[5] Create a MC for changing the disk by path:
+~~~
+$ cat machine_conf.yaml
+################
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: custom
+  name: 98-var-lib-containers
+spec:
+  config:
+    ignition:
+      version: 3.1.0
+    systemd:
+      units:
+      - contents: |
+          [Unit]
+          Description=Make File System on /dev/sdb
+          DefaultDependencies=no
+          BindsTo=dev-sdb.device
+          After=dev-sdb.device var.mount
+          Before=systemd-fsck@dev-sdb.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=-/bin/bash -c "/bin/rm -rf /var/lib/containers/*"
+          ExecStart=/usr/lib/systemd/systemd-makefs xfs /dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0
+          TimeoutSec=0
+          [Install]
+          WantedBy=var-lib-containers.mount
+        enabled: true
+        name: systemd-mkfs@dev-sdb.service
+      - contents: |
+          [Unit]
+          Description=Mount /dev/sdb to /var/lib/containers
+          Before=local-fs.target
+          Requires=systemd-mkfs@dev-sdb.service
+          After=systemd-mkfs@dev-sdb.service
+          [Mount]
+          What=/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0
+          Where=/var/lib/containers
+          Type=xfs
+          Options=defaults,prjquota
+          [Install]
+          WantedBy=local-fs.target
+        enabled: true
+        name: var-lib-containers.mount
+      - contents: |
+          [Unit]
+          Description=Restore recursive SELinux security contexts
+          DefaultDependencies=no
+          After=var-lib-containers.mount
+          Before=crio.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/sbin/restorecon -R /var/lib/containers/
+          TimeoutSec=0
+          [Install]
+          WantedBy=multi-user.target graphical.target
+        enabled: true
+        name: restorecon-var-lib-containers.service
+###############
+~~~
+[6] Apply the above configuration as MC:
+~~~
+$ oc create -f machine_conf.yaml
+~~~
+[7] Verify that mc gets created & mcp starts updating:
+~~~
+$ oc get mc
+$ oc get map
+~~~
+[8] Then you can check manually by connecting nodes by ssh.
